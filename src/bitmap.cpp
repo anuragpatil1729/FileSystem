@@ -1,6 +1,7 @@
 #include "bitmap.hpp"
 
 #include <algorithm>
+#include <cstring>
 
 Bitmap::Bitmap()
     : bitCount_(0) {
@@ -107,4 +108,28 @@ std::size_t Bitmap::countFree() const {
 
 std::size_t Bitmap::countUsed() const {
     return bitCount_ - countFree();
+}
+
+const std::vector<std::uint8_t>& Bitmap::getRawBits() const {
+    return bits_;
+}
+
+const std::uint8_t* Bitmap::data() const {
+    return bits_.data();
+}
+
+std::size_t Bitmap::byteSize() const {
+    return bits_.size();
+}
+
+void Bitmap::loadBits(const std::uint8_t* buffer, std::size_t byteCount) {
+    const std::size_t toCopy = std::min(byteCount, bits_.size());
+    if (toCopy > 0 && buffer != nullptr) {
+        std::memcpy(bits_.data(), buffer, toCopy);
+    }
+    // Zero out any leftover bits beyond bitCount_ in the last byte
+    if (bitCount_ % 8 != 0 && !bits_.empty()) {
+        const std::uint8_t mask = static_cast<std::uint8_t>((1u << (bitCount_ % 8)) - 1u);
+        bits_.back() &= mask;
+    }
 }

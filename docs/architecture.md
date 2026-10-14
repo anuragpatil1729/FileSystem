@@ -1,194 +1,156 @@
-
 # VirtualFileSystem Architecture
 
 ## 1. Overview
 
-VirtualFileSystem is a user-space simulation of selected operating
-system concepts. It combines a block-based virtual disk, basic
-filesystem structures, a CPU scheduler, and paged memory management.
+VirtualFileSystem is a functional C++17 user-space operating system environment featuring a persistent block-based filesystem, a Round-Robin CPU process scheduler with detailed performance metrics, and a virtual memory manager supporting demand paging and page replacement.
 
-## 2. High-level architecture
+---
 
-```text
-                    CLI (main.cpp)
-                          |
-             +------------+------------+
-             |            |            |
-             v            v            v
-         FileSystem    Scheduler   MemoryManager
-             |            |            |
-      +------+------+   Process     PageTable
-      |      |      |      |
-      v      v      v      v
-     Disk  Inode  Bitmap  Round-Robin
-   Manager Table  /Directory
-      |
-      v
- virtual_disk.bin
-```
-
-## 3. Disk subsystem
-
-### DiskManager
-
-Responsibilities:
-- Initialize the binary disk file.
-- Read a fixed-size block.
-- Write a fixed-size block.
-- Reject invalid block numbers.
-
-The default block size is 4096 bytes, and the default disk contains
-1024 blocks.
-
-The default disk capacity is therefore:
-
-1024 x 4096 = 4,194,304 bytes (4 MiB).
-
-### Superblock
-
-The superblock describes filesystem geometry and metadata locations,
-including block size, total blocks, inode counts, and filesystem region
-offsets.
-
-### Bitmap
-
-A bitmap tracks whether resources are allocated. Separate bitmaps are
-used for inode allocation and block allocation.
-
-### Inode
-
-An inode represents a file or directory and stores metadata such as
-its type, size, permissions, timestamps, and data-block references.
-
-### Directory
-
-A directory maps a name to an inode number. The current implementation
-uses an in-memory collection of directory entries.
-
-## 4. File operations
-
-The intended file-operation flow is:
+## 2. System Architecture
 
 ```text
-CLI command
-    |
-    v
-FileSystem
-    |
-    +--> Resolve pathname
-    |
-    +--> Allocate or locate inode
-    |
-    +--> Allocate data block if needed
-    |
-    +--> Read/write through DiskManager
-    |
-    +--> Update filesystem metadata
+                               CLI (src/main.cpp)
+                                       |
+             +-------------------------+-------------------------+
+             |                         |                         |
+             v                         v                         v
+        FileSystem                 Scheduler               MemoryManager
+             |                         |                         |
+     +-------+-------+             Process                PageTable / Frames
+     |       |       |                 |                         |
+     v       v       v                 v                         v
+ Superblock Inode  Bitmap         Round-Robin             FIFO / LRU
+   (v2)    Table  Allocators      Timeline & Metrics      Demand Paging
+     |       |       |
+     +-------+-------+
+             |
+             v
+        DiskManager
+             |
+             v
+      virtual_disk.bin
 ```
 
-The current prototype supports basic operations for entries directly
-under the root directory. It does not yet implement a full nested
-directory hierarchy.
+---
 
-## 5. CPU virtualization
+## 3. On-Disk Filesystem Architecture
 
-### Process
+### 3.1 Disk Layout (Version 2)
 
-A process stores:
-- Process ID
-- Name
-- CPU burst duration
-- Remaining execution time
-- Priority
-- Process state
-
-### Scheduler
-
-The scheduler implements Round-Robin time slicing.
-
-Each ready process receives up to one time quantum. If it still has
-remaining execution time, it returns to the end of the ready queue.
-
-Example:
+The virtual disk is divided into fixed 4096-byte blocks:
 
 ```text
-P1 (5 units)
-P2 (3 units)
-Time quantum = 2
-
-Execution order:
-P1 -> P2 -> P1 -> P2 -> P1
++-------------------+--------------------+--------------------+--------------------+--------------------+
+| Block 0           | Block 1 .. S1      | Block S1+1 .. S2   | Block S2+1 .. S3   | Block S3+1 .. End  |
+| Superblock        | Inode Bitmap       | Block Bitmap       | Inode Table        | Data Blocks        |
++-------------------+--------------------+--------------------+--------------------+--------------------+
 ```
 
-This models fair sharing of a simulated CPU between processes.
+The region boundaries are computed as a deterministic function of `(totalBlocks, totalInodes)`:
+- `inodeBitmapBlocks` = $\lceil \text{totalInodes} / (4096 \times 8) \rceil$
+- `blockBitmapBlocks` = $\lceil \text{totalBlocks} / (4096 \times 8) \rceil$
+- `inodeTableBlocks`  = $\lceil \text{totalInodes} / 32 \rceil$ (since each on-disk inode record is 128 bytes)
+- `dataBlockStart`    = $1 + \text{inodeBitmapBlocks} + \text{blockBitmapBlocks} + \text{inodeTableBlocks}$
 
-## 6. Memory virtualization
+### 3.2 Superblock
+Stores global metadata:
+- `magic`: `0x56534653` ("VSFS").
+- `version`: `2`.
+- `blockSize`: `4096`.
+- `totalBlocks`, `freeBlocks`, `totalInodes`, `freeInodes`.
+- Region start block numbers and block counts.
+- `rootInode`: `0`.
+- Little-endian serialized fields via `byte_io.hpp`.
 
-### MemoryManager
+### 3.3 Inodes & Multi-Block Storage
+Each inode is serialized to an exact 128-byte record (32 records per 4096-byte block):
+- `inodeNumber` (4 bytes)
+- `type` (1 byte: `FREE=0`, `FILE=1`, `DIRECTORY=2`)
+- `size` (4 bytes)
+- `owner`, `permissions`, `linkCount` (4 bytes each)
+- `directBlocks[12]` (48 bytes): direct pointers to data blocks 0..11.
+- `indirectBlock` (4 bytes): pointer to a single indirect block containing 1024 32-bit block pointers.
+- `createdAt`, `modifiedAt` (8 bytes each, Unix timestamp in seconds).
+- `reserved` (36 bytes zero-padding).
 
-The memory manager maintains simulated physical memory and tracks
-available physical frames.
+**Maximum Supported File Size**:
+$$(12 \text{ direct blocks} + 1024 \text{ indirect pointers}) \times 4096 \text{ bytes} = 1036 \text{ blocks} = 4,243,456 \text{ bytes } (\approx 4.047 \text{ MiB})$$
 
-### PageTable
+### 3.4 Hierarchical Directories
+Directories are stored as standard inodes with `InodeType::DIRECTORY`.
+Directory data blocks hold an array of 128-byte entries:
+- `inodeNumber` (4 bytes)
+- `nameLength` (4 bytes)
+- `name` (up to 120 bytes, null-terminated)
 
-Each process has a page table mapping virtual pages to physical frames.
+Path resolution recursively splits paths on `/`, normalizes redundant and trailing separators, and traverses the directory tree starting from root Inode 0.
 
-Address translation:
+### 3.5 Metadata Consistency & Integrity Audit
+On mount, `FileSystem::validateMetadataConsistency()` verifies:
+1. Superblock magic, version, block size, and boundary math.
+2. Actual image file size on host matches `totalBlocks`.
+3. Root inode exists, is marked allocated in `inodeBitmap`, and is a `DIRECTORY`.
+4. All allocated inodes are marked in `inodeBitmap` and have valid types.
+5. All data block pointers are within bounds $[\text{dataBlockStart}, \text{totalBlocks})$.
+6. Block leak detection: constructs a reference-count map across all inodes (direct and indirect). Any orphan allocated block or double-allocated block aborts the mount.
+7. Directory entry validity: entries reference allocated inodes with unique names.
 
-```text
-Virtual address
-       |
-       +--> Virtual page number
-       |
-       +--> Offset within page
-                 |
-                 v
-              PageTable
-                 |
-                 v
-           Physical frame
-                 |
-                 v
-Physical address = frame * page_size + offset
-```
+---
 
-For a page size of 4096 bytes:
+## 4. CPU Virtualization & Scheduling
 
-```text
-Virtual address = 4200
-Virtual page    = 4200 / 4096 = 1
-Offset          = 4200 % 4096 = 104
-```
+### 4.1 Process Model
+Represents simulated processes:
+- `pid`, `name`, `priority`, `arrivalTime`.
+- `burstTime` and `remainingTime`.
+- State transitions: `NEW` $\to$ `READY` $\to$ `RUNNING` $\to$ `TERMINATED` (or `BLOCKED`).
 
-If virtual page 1 maps to physical frame 3:
+### 4.2 Round-Robin Algorithm
+- Executes up to `timeQuantum` units per slice.
+- Respects process arrival times and accounts for CPU idle intervals.
+- Generates a chronological Gantt timeline with start and end timestamps.
 
-```text
-Physical address = 3 * 4096 + 104
-                 = 12392
-```
+### 4.3 Scheduling Metrics
+Computes simulated execution metrics:
+- **Completion Time** ($C_i$): Time unit when process finishes execution.
+- **Turnaround Time** ($TAT_i = C_i - \text{Arrival}_i$).
+- **Waiting Time** ($WT_i = TAT_i - \text{Burst}_i$).
+- **Response Time** ($RT_i = \text{FirstSchedule}_i - \text{Arrival}_i$).
+- **Average Waiting Time** & **Average Turnaround Time**.
+- **CPU Utilization (%)** = $(\text{Total Busy Time} / \text{Total Elapsed Time}) \times 100$.
 
-The implementation currently allocates physical frames eagerly;
-demand paging and page replacement are future extensions.
+---
 
-## 7. Testing strategy
+## 5. Memory Virtualization
 
-| Test | Responsibility |
-|---|---|
-| test_disk | Disk initialization and block I/O |
-| test_filesystem | File and directory operations |
-| test_scheduler | Round-Robin execution order |
-| test_memory | Address translation and frame management |
+### 5.1 Paging Model
+- Physical memory is simulated as a byte buffer organized into 4096-byte frames.
+- Frame allocation tracked via `frameBitmap_`.
+- Each process has an isolated `PageTable`.
 
-Tests are built as separate executables and can be run using CTest.
+### 5.2 Address Translation & Bounds Checking
+Virtual address translation maps $(\text{virtualPage}, \text{offset})$ to physical frame:
+$$\text{Physical Address} = (\text{frameNumber} \times 4096) + \text{offset}$$
+Safeguards:
+- Rejects virtual addresses beyond the process's allocated virtual size.
+- Detects integer overflows.
+- Enforces write permissions.
 
-## 8. Current limitations
+### 5.3 Demand Paging & Page Replacement
+- **Eager Allocation**: Frames allocated up-front during process creation.
+- **Demand Paging**: Virtual pages are created with `present = false`. Access triggers a page fault:
+  - If a free frame exists, it is allocated and mapped.
+  - If physical memory is full, the configured page replacement algorithm evicts a victim frame:
+    - **FIFO**: Evicts the frame allocated earliest.
+    - **LRU**: Evicts the frame with the oldest access timestamp.
+  - Eviction unmaps the page from the victim process table.
+  - Metrics track total page faults and page replacements.
 
-- Filesystem metadata is not fully persisted to the virtual disk.
-- Formatting resets the disk in the current CLI.
-- Directories are not a complete hierarchical filesystem.
-- File data storage is limited by the current implementation.
-- CPU scheduling and memory management are simulations, not kernel services.
+---
 
-The next architectural milestone is persistent filesystem metadata,
-followed by nested paths, multi-block files, and recovery tests.
+## 6. Testing Strategy
 
+1. `test_disk`: Block I/O, dynamic geometry updating, `attachExisting` validation, and fault injection.
+2. `test_filesystem`: Hierarchical directories, path normalization, multi-block files, indirect blocks, persistence across restarts, inode/block exhaustion, corrupt image rejection, and staged rollback.
+3. `test_scheduler`: Round-robin execution, arrival times, idle handling, turnaround/waiting/response metrics, and repeatability.
+4. `test_memory`: Address translation, eager allocation, bounds checking, demand paging, FIFO replacement, and LRU replacement.

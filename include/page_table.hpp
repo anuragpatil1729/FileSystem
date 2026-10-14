@@ -9,6 +9,8 @@ struct PageTableEntry {
     int frameNumber;
     bool present;
     bool writable;
+    bool dirty;
+    std::size_t lastAccessTime;
 
     PageTableEntry(
         int frame = -1,
@@ -20,12 +22,14 @@ struct PageTableEntry {
 class PageTable {
 public:
     explicit PageTable(
-        std::uint32_t pid = 0
+        std::uint32_t pid = 0,
+        std::size_t virtualMemorySize = 0
     );
 
     bool mapPage(
         std::size_t virtualPage,
-        std::size_t physicalFrame
+        std::size_t physicalFrame,
+        bool writable = true
     );
 
     bool unmapPage(
@@ -44,9 +48,15 @@ public:
 
     std::size_t size() const;
 
+    std::size_t getVirtualMemorySize() const;
+    void setVirtualMemorySize(std::size_t size);
+
+    PageTableEntry* getEntry(std::size_t virtualPage);
+    const PageTableEntry* getEntry(std::size_t virtualPage) const;
+
 private:
     std::uint32_t pid_;
-
+    std::size_t virtualMemorySize_;
     std::vector<PageTableEntry> entries_;
 };
 

@@ -1,6 +1,7 @@
 #ifndef DIRECTORY_HPP
 #define DIRECTORY_HPP
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -12,6 +13,9 @@ struct DirectoryEntry {
 
 class Directory {
 public:
+    static constexpr std::size_t ENTRY_SIZE = 128;
+    static constexpr std::size_t MAX_NAME_LENGTH = 120;
+
     Directory();
 
     bool addEntry(
@@ -34,6 +38,11 @@ public:
     const std::vector<DirectoryEntry>& getEntries() const;
 
     std::size_t size() const;
+    bool empty() const;
+    void clear();
+
+    std::vector<std::uint8_t> serialize() const;
+    bool deserialize(const std::uint8_t* data, std::size_t byteCount);
 
 private:
     std::vector<DirectoryEntry> entries_;

@@ -1,126 +1,163 @@
 #include "filesystem.hpp"
+#include "byte_io.hpp"
 
 #include <algorithm>
-#include <array>
 #include <cstring>
 #include <iostream>
 #include <limits>
-#include <iterator>
-#include <type_traits>
+#include <sstream>
+#include <unordered_set>
 #include <vector>
 
 namespace {
-constexpr std::size_t B = DiskManager::BLOCK_SIZE;
-constexpr std::size_t DIRECTORY_NAME_BYTES = 252;
+constexpr std::size_t B = Superblock::BLOCK_SIZE;
 
-struct DiskDirectoryEntry {
-    std::uint32_t inodeNumber;
-    char name[DIRECTORY_NAME_BYTES];
-};
-
-struct DiskDirectoryBlock {
-    std::uint32_t count;
-    DiskDirectoryEntry entries[(B - sizeof(std::uint32_t)) / sizeof(DiskDirectoryEntry)];
-};
-
-static_assert(sizeof(DiskDirectoryBlock) <= B, "Directory metadata must fit in one block");
-static_assert(std::is_trivially_copyable<Superblock>::value,
-              "Superblock must be trivially copyable for this prototype format");
-static_assert(std::is_trivially_copyable<Inode>::value,
-              "Inode must be trivially copyable for this prototype format");
-
-bool writeBytesToBlocks(DiskManager& disk, std::size_t firstBlock,
-                        std::size_t blockCount, const void* source,
-                        std::size_t byteCount) {
-    const auto capacity = blockCount * B;
-    if (byteCount > capacity) return false;
-
-    const auto* bytes = static_cast<const unsigned char*>(source);
-    std::vector<unsigned char> buffer(capacity, 0);
-    if (byteCount != 0) std::memcpy(buffer.data(), bytes, byteCount);
-
-    for (std::size_t i = 0; i < blockCount; ++i) {
-        if (!disk.writeBlock(firstBlock + i, buffer.data() + i * B)) return false;
-    }
-    return true;
+bool fail(std::string* err, const std::string& msg) {
+    if (err) *err = msg;
+    return false;
 }
-
-bool readBytesFromBlocks(DiskManager& disk, std::size_t firstBlock,
-                         std::size_t blockCount, void* destination,
-                         std::size_t byteCount) {
-    const auto capacity = blockCount * B;
-    if (byteCount > capacity) return false;
-
-    std::vector<unsigned char> buffer(capacity, 0);
-    for (std::size_t i = 0; i < blockCount; ++i) {
-        if (!disk.readBlock(firstBlock + i, buffer.data() + i * B)) return false;
-    }
-    if (byteCount != 0) std::memcpy(destination, buffer.data(), byteCount);
-    return true;
-}
-}
+} // namespace
 
 FileSystem::FileSystem(const std::string& diskPath)
-    : disk_(diskPath), mounted_(false) {}
+    : disk_(diskPath),
+      mounted_(false) {
+}
 
-bool FileSystem::format(std::size_t blockCount, std::uint32_t inodeCount) {
-    if (blockCount == 0 || inodeCount == 0 ||
-        blockCount > std::numeric_limits<std::uint32_t>::max()) return false;
+void FileSystem::setError(const std::string& msg) const {
+    lastError_ = msg;
+}
 
-    DiskManager newDisk(disk_.getDiskPath(), blockCount);
-    if (!newDisk.initialize()) return false;
+const std::string& FileSystem::getLastError() const {
+    return lastError_;
+}
 
-    superblock_.initialize(static_cast<std::uint32_t>(blockCount), inodeCount);
-    if (!superblock_.isValid() || superblock_.dataBlockStart >= blockCount) return false;
+bool FileSystem::isMounted() const {
+    return mounted_;
+}
 
-    inodeBitmap_.initialize(inodeCount);
-    blockBitmap_.initialize(blockCount);
-    inodes_.clear();
-    inodes_.resize(inodeCount);
-    rootDirectory_ = Directory{};
+const Superblock& FileSystem::getSuperblock() const {
+    return superblock_;
+}
 
-    // Reserve the superblock, both bitmaps, and inode-table blocks.
-    blockBitmap_.set(0);
-    blockBitmap_.set(superblock_.inodeBitmapStart);
-    blockBitmap_.set(superblock_.blockBitmapStart);
-    for (std::size_t i = 0; i < superblock_.inodeTableBlocks; ++i) {
-        blockBitmap_.set(superblock_.inodeTableStart + i);
+DiskManager& FileSystem::getDiskManager() {
+    return disk_;
+}
+
+const DiskManager& FileSystem::getDiskManager() const {
+    return disk_;
+}
+
+std::size_t FileSystem::getMaxFileSize() const {
+    return Inode::MAX_FILE_SIZE;
+}
+
+std::vector<std::string> FileSystem::splitPath(const std::string& path) {
+    std::vector<std::string> parts;
+    std::string token;
+    for (char ch : path) {
+        if (ch == '/') {
+            if (!token.empty()) {
+                parts.push_back(token);
+                token.clear();
+            }
+        } else {
+            token += ch;
+        }
     }
+    if (!token.empty()) {
+        parts.push_back(token);
+    }
+    return parts;
+}
 
-    const int root = allocateInode(InodeType::DIRECTORY);
-    if (root != 0) return false;
-
-    // The root directory itself occupies one data block so its entries persist.
-    const int directoryBlock = allocateBlock();
-    if (directoryBlock < 0) return false;
-    inodes_[0].directBlocks[0] = static_cast<std::uint32_t>(directoryBlock);
-
-    mounted_ = true;
-    if (!persistMetadata()) {
-        mounted_ = false;
+bool FileSystem::resolveParentAndName(const std::string& path,
+                                      std::uint32_t& parentInode,
+                                      std::string& entryName) const {
+    const auto parts = splitPath(path);
+    if (parts.empty()) {
+        setError("Cannot modify root directory itself");
         return false;
     }
+
+    entryName = parts.back();
+    if (entryName.empty() || entryName.size() > Directory::MAX_NAME_LENGTH) {
+        setError("Invalid component name length");
+        return false;
+    }
+
+    if (parts.size() == 1) {
+        parentInode = Superblock::ROOT_INODE;
+        return true;
+    }
+
+    std::uint32_t curr = Superblock::ROOT_INODE;
+    for (std::size_t i = 0; i < parts.size() - 1; ++i) {
+        if (curr >= inodes_.size() || !inodes_[curr].isDirectory()) {
+            setError("Path component is not a directory");
+            return false;
+        }
+        Directory dir;
+        if (!loadDirectory(curr, dir)) {
+            setError("Failed to load directory");
+            return false;
+        }
+        const int next = dir.findEntry(parts[i]);
+        if (next < 0) {
+            setError("Directory component '" + parts[i] + "' not found");
+            return false;
+        }
+        curr = static_cast<std::uint32_t>(next);
+    }
+
+    if (curr >= inodes_.size() || !inodes_[curr].isDirectory()) {
+        setError("Parent component is not a directory");
+        return false;
+    }
+
+    parentInode = curr;
     return true;
 }
 
-bool FileSystem::mount() {
-    if (mounted_) return true;
-    if (!loadMetadata()) return false;
-    mounted_ = true;
-    return true;
+int FileSystem::resolvePath(const std::string& path) const {
+    if (!mounted_) return -1;
+
+    const auto parts = splitPath(path);
+    if (parts.empty()) {
+        return static_cast<int>(Superblock::ROOT_INODE);
+    }
+
+    std::uint32_t curr = Superblock::ROOT_INODE;
+    for (const auto& part : parts) {
+        if (curr >= inodes_.size() || !inodes_[curr].isDirectory()) {
+            return -1;
+        }
+        Directory dir;
+        if (!loadDirectory(curr, dir)) {
+            return -1;
+        }
+        const int next = dir.findEntry(part);
+        if (next < 0) {
+            return -1;
+        }
+        curr = static_cast<std::uint32_t>(next);
+    }
+
+    return static_cast<int>(curr);
 }
 
-bool FileSystem::unmount() {
-    if (!mounted_) return true;
-    if (!persistMetadata()) return false;
-    mounted_ = false;
-    return true;
+int FileSystem::findInode(const std::string& path) const {
+    return resolvePath(path);
 }
 
 int FileSystem::allocateInode(InodeType type) {
     const std::size_t index = inodeBitmap_.findFree();
-    if (index >= inodeBitmap_.size()) return -1;
-    if (!inodeBitmap_.set(index)) return -1;
+    if (index >= inodeBitmap_.size()) {
+        setError("No free inodes available");
+        return -1;
+    }
+    if (!inodeBitmap_.set(index)) {
+        return -1;
+    }
     inodes_[index].initialize(static_cast<std::uint32_t>(index), type);
     return static_cast<int>(index);
 }
@@ -128,160 +165,617 @@ int FileSystem::allocateInode(InodeType type) {
 int FileSystem::allocateBlock() {
     for (std::size_t i = superblock_.dataBlockStart; i < blockBitmap_.size(); ++i) {
         if (blockBitmap_.isFree(i)) {
-            if (!blockBitmap_.set(i)) return -1;
+            if (!blockBitmap_.set(i)) {
+                return -1;
+            }
             return static_cast<int>(i);
         }
     }
+    setError("No free data blocks available");
     return -1;
 }
 
 bool FileSystem::freeBlock(std::size_t blockNumber) {
-    if (blockNumber < superblock_.dataBlockStart || blockNumber >= blockBitmap_.size())
+    if (blockNumber < superblock_.dataBlockStart || blockNumber >= blockBitmap_.size()) {
         return false;
+    }
     return blockBitmap_.clear(blockNumber);
 }
 
-std::string FileSystem::normalizePath(const std::string& path) const {
-    if (path.empty()) return "/";
-    return path.front() == '/' ? path : "/" + path;
+void FileSystem::freeInodeBlocks(Inode& inode) {
+    for (std::size_t i = 0; i < Inode::DIRECT_BLOCKS; ++i) {
+        if (inode.directBlocks[i] != 0) {
+            freeBlock(inode.directBlocks[i]);
+            inode.directBlocks[i] = 0;
+        }
+    }
+
+    if (inode.indirectBlock != 0) {
+        std::vector<std::uint8_t> blockBuf(B, 0);
+        if (disk_.readBlock(inode.indirectBlock, blockBuf.data())) {
+            for (std::size_t p = 0; p < Inode::POINTERS_PER_INDIRECT; ++p) {
+                const std::uint32_t ptr = byteio::getU32(blockBuf.data() + p * 4);
+                if (ptr != 0) {
+                    freeBlock(ptr);
+                }
+            }
+        }
+        freeBlock(inode.indirectBlock);
+        inode.indirectBlock = 0;
+    }
+
+    inode.size = 0;
 }
 
-int FileSystem::findInode(const std::string& path) const {
-    const std::string normalized = normalizePath(path);
-    if (normalized == "/") return inodes_.empty() ? -1 : 0;
-    if (normalized.size() <= 1 || normalized.find('/', 1) != std::string::npos) return -1;
-    return rootDirectory_.findEntry(normalized.substr(1));
+bool FileSystem::format(std::size_t blockCount, std::uint32_t inodeCount) {
+    Superblock sb;
+    std::string err;
+    if (!sb.initialize(static_cast<std::uint32_t>(blockCount), inodeCount, &err)) {
+        setError("Format validation failed: " + err);
+        return false;
+    }
+
+    if (!disk_.initialize(blockCount)) {
+        setError("Failed to initialize virtual disk image");
+        return false;
+    }
+
+    superblock_ = sb;
+    inodeBitmap_.initialize(superblock_.totalInodes);
+    blockBitmap_.initialize(superblock_.totalBlocks);
+    inodes_.assign(superblock_.totalInodes, Inode{});
+
+    // Mark metadata regions as allocated in block bitmap
+    blockBitmap_.set(0); // Superblock
+    for (std::size_t i = 0; i < superblock_.inodeBitmapBlocks; ++i) {
+        blockBitmap_.set(superblock_.inodeBitmapStart + i);
+    }
+    for (std::size_t i = 0; i < superblock_.blockBitmapBlocks; ++i) {
+        blockBitmap_.set(superblock_.blockBitmapStart + i);
+    }
+    for (std::size_t i = 0; i < superblock_.inodeTableBlocks; ++i) {
+        blockBitmap_.set(superblock_.inodeTableStart + i);
+    }
+
+    // Allocate root directory at inode 0
+    const int rootIdx = allocateInode(InodeType::DIRECTORY);
+    if (rootIdx != static_cast<int>(Superblock::ROOT_INODE)) {
+        setError("Failed to allocate root inode");
+        return false;
+    }
+
+    mounted_ = true;
+    if (!persistMetadata()) {
+        mounted_ = false;
+        setError("Failed to persist initial metadata");
+        return false;
+    }
+
+    return true;
+}
+
+bool FileSystem::mount() {
+    if (mounted_) return true;
+    if (!loadMetadata()) {
+        mounted_ = false;
+        return false;
+    }
+    mounted_ = true;
+    return true;
+}
+
+bool FileSystem::unmount() {
+    if (!mounted_) return true;
+    const bool ok = persistMetadata();
+    mounted_ = false;
+    return ok;
+}
+
+bool FileSystem::readInodeData(std::uint32_t inodeNumber,
+                              std::vector<std::uint8_t>& out) const {
+    if (inodeNumber >= inodes_.size()) {
+        setError("Invalid inode number");
+        return false;
+    }
+
+    const Inode& inode = inodes_[inodeNumber];
+    out.resize(inode.size);
+    if (inode.size == 0) {
+        return true;
+    }
+
+    const std::size_t numBlocks = (inode.size + B - 1) / B;
+    if (numBlocks > Inode::MAX_DATA_BLOCKS) {
+        setError("Inode size exceeds maximum supported blocks");
+        return false;
+    }
+
+    std::vector<std::uint32_t> indirectTable(Inode::POINTERS_PER_INDIRECT, 0);
+    if (numBlocks > Inode::DIRECT_BLOCKS) {
+        if (inode.indirectBlock == 0) {
+            setError("Missing indirect block for multi-block inode");
+            return false;
+        }
+        std::vector<std::uint8_t> buf(B, 0);
+        if (!disk_.readBlock(inode.indirectBlock, buf.data())) {
+            setError("Failed to read indirect block");
+            return false;
+        }
+        for (std::size_t p = 0; p < Inode::POINTERS_PER_INDIRECT; ++p) {
+            indirectTable[p] = byteio::getU32(buf.data() + p * 4);
+        }
+    }
+
+    for (std::size_t k = 0; k < numBlocks; ++k) {
+        const std::uint32_t phys = (k < Inode::DIRECT_BLOCKS)
+                                       ? inode.directBlocks[k]
+                                       : indirectTable[k - Inode::DIRECT_BLOCKS];
+        const std::size_t offset = k * B;
+        const std::size_t bytesToCopy = std::min(B, inode.size - offset);
+
+        if (phys == 0) {
+            std::memset(out.data() + offset, 0, bytesToCopy);
+        } else {
+            std::vector<std::uint8_t> blockBuf(B, 0);
+            if (!disk_.readBlock(phys, blockBuf.data())) {
+                setError("Failed to read data block " + std::to_string(phys));
+                return false;
+            }
+            std::memcpy(out.data() + offset, blockBuf.data(), bytesToCopy);
+        }
+    }
+
+    return true;
+}
+
+bool FileSystem::writeInodeData(std::uint32_t inodeNumber,
+                               const void* data,
+                               std::size_t size) {
+    if (inodeNumber >= inodes_.size()) {
+        setError("Invalid inode number");
+        return false;
+    }
+    if (size > Inode::MAX_FILE_SIZE) {
+        setError("Write size exceeds maximum supported file size (" +
+                 std::to_string(Inode::MAX_FILE_SIZE) + " bytes)");
+        return false;
+    }
+
+    Inode& inode = inodes_[inodeNumber];
+    const std::size_t oldBlocks = (inode.size + B - 1) / B;
+    const std::size_t newBlocks = (size + B - 1) / B;
+    const bool needIndirect = (newBlocks > Inode::DIRECT_BLOCKS);
+    const bool hadIndirect = (inode.indirectBlock != 0);
+
+    // Calculate additional blocks required
+    const std::size_t addData = (newBlocks > oldBlocks) ? (newBlocks - oldBlocks) : 0;
+    const std::size_t addInd = (needIndirect && !hadIndirect) ? 1 : 0;
+    const std::size_t totalNeeded = addData + addInd;
+
+    if (blockBitmap_.countFree() < totalNeeded) {
+        setError("Disk space exhausted: cannot allocate " +
+                 std::to_string(totalNeeded) + " blocks");
+        return false;
+    }
+
+    // Preserve original block state in case rollback is needed
+    const Inode origInode = inode;
+    std::vector<std::size_t> allocatedBlocks;
+    auto allocNew = [&]() -> int {
+        const int b = allocateBlock();
+        if (b >= 0) {
+            allocatedBlocks.push_back(static_cast<std::size_t>(b));
+        }
+        return b;
+    };
+
+    auto rollback = [&]() {
+        for (std::size_t b : allocatedBlocks) {
+            freeBlock(b);
+        }
+        inode = origInode;
+    };
+
+    std::vector<std::uint32_t> indirectTable(Inode::POINTERS_PER_INDIRECT, 0);
+    if (hadIndirect) {
+        std::vector<std::uint8_t> buf(B, 0);
+        if (disk_.readBlock(inode.indirectBlock, buf.data())) {
+            for (std::size_t p = 0; p < Inode::POINTERS_PER_INDIRECT; ++p) {
+                indirectTable[p] = byteio::getU32(buf.data() + p * 4);
+            }
+        }
+    }
+
+    if (needIndirect && !hadIndirect) {
+        const int indBlock = allocNew();
+        if (indBlock < 0) {
+            rollback();
+            return false;
+        }
+        inode.indirectBlock = static_cast<std::uint32_t>(indBlock);
+    }
+
+    const auto* src = static_cast<const std::uint8_t*>(data);
+
+    for (std::size_t k = 0; k < newBlocks; ++k) {
+        std::uint32_t phys = 0;
+        if (k < Inode::DIRECT_BLOCKS) {
+            if (inode.directBlocks[k] == 0) {
+                const int nb = allocNew();
+                if (nb < 0) {
+                    rollback();
+                    return false;
+                }
+                inode.directBlocks[k] = static_cast<std::uint32_t>(nb);
+            }
+            phys = inode.directBlocks[k];
+        } else {
+            const std::size_t idx = k - Inode::DIRECT_BLOCKS;
+            if (indirectTable[idx] == 0) {
+                const int nb = allocNew();
+                if (nb < 0) {
+                    rollback();
+                    return false;
+                }
+                indirectTable[idx] = static_cast<std::uint32_t>(nb);
+            }
+            phys = indirectTable[idx];
+        }
+
+        const std::size_t offset = k * B;
+        const std::size_t bytesToWrite = std::min(B, size - offset);
+        std::vector<std::uint8_t> blockBuf(B, 0);
+        if (bytesToWrite > 0 && src != nullptr) {
+            std::memcpy(blockBuf.data(), src + offset, bytesToWrite);
+        }
+
+        if (!disk_.writeBlock(phys, blockBuf.data())) {
+            setError("Disk write failed for block " + std::to_string(phys));
+            rollback();
+            return false;
+        }
+    }
+
+    if (needIndirect) {
+        std::vector<std::uint8_t> buf(B, 0);
+        for (std::size_t p = 0; p < Inode::POINTERS_PER_INDIRECT; ++p) {
+            byteio::putU32(buf.data() + p * 4, indirectTable[p]);
+        }
+        if (!disk_.writeBlock(inode.indirectBlock, buf.data())) {
+            setError("Disk write failed for indirect block");
+            rollback();
+            return false;
+        }
+    }
+
+    // Free truncated blocks
+    if (newBlocks < oldBlocks) {
+        if (hadIndirect) {
+            for (std::size_t k = std::max<std::size_t>(Inode::DIRECT_BLOCKS, newBlocks);
+                 k < oldBlocks; ++k) {
+                const std::size_t idx = k - Inode::DIRECT_BLOCKS;
+                if (idx < Inode::POINTERS_PER_INDIRECT && indirectTable[idx] != 0) {
+                    freeBlock(indirectTable[idx]);
+                    indirectTable[idx] = 0;
+                }
+            }
+            if (!needIndirect && inode.indirectBlock != 0) {
+                freeBlock(inode.indirectBlock);
+                inode.indirectBlock = 0;
+            } else if (needIndirect) {
+                std::vector<std::uint8_t> buf(B, 0);
+                for (std::size_t p = 0; p < Inode::POINTERS_PER_INDIRECT; ++p) {
+                    byteio::putU32(buf.data() + p * 4, indirectTable[p]);
+                }
+                disk_.writeBlock(inode.indirectBlock, buf.data());
+            }
+        }
+        for (std::size_t k = newBlocks; k < std::min<std::size_t>(Inode::DIRECT_BLOCKS, oldBlocks); ++k) {
+            if (inode.directBlocks[k] != 0) {
+                freeBlock(inode.directBlocks[k]);
+                inode.directBlocks[k] = 0;
+            }
+        }
+    }
+
+    inode.size = static_cast<std::uint32_t>(size);
+    inode.touch();
+
+    if (!persistMetadata()) {
+        setError("Failed to persist metadata after write");
+        return false;
+    }
+
+    return true;
+}
+
+bool FileSystem::loadDirectory(std::uint32_t inodeNumber, Directory& dir) const {
+    std::vector<std::uint8_t> data;
+    if (!readInodeData(inodeNumber, data)) {
+        return false;
+    }
+    return dir.deserialize(data.data(), data.size());
+}
+
+bool FileSystem::saveDirectory(std::uint32_t inodeNumber, const Directory& dir) {
+    const auto data = dir.serialize();
+    return writeInodeData(inodeNumber, data.data(), data.size());
 }
 
 bool FileSystem::createFile(const std::string& path) {
-    if (!mounted_) return false;
-    const std::string normalized = normalizePath(path);
-    if (normalized == "/" || normalized.find('/', 1) != std::string::npos) return false;
-    const std::string name = normalized.substr(1);
-    if (name.empty() || name.size() >= DIRECTORY_NAME_BYTES || rootDirectory_.exists(name)) return false;
+    if (!mounted_) {
+        setError("Filesystem not mounted");
+        return false;
+    }
 
-    const int inode = allocateInode(InodeType::FILE);
-    if (inode < 0) return false;
-    if (!rootDirectory_.addEntry(name, static_cast<std::uint32_t>(inode))) {
-        inodeBitmap_.clear(static_cast<std::size_t>(inode));
-        inodes_[static_cast<std::size_t>(inode)] = Inode{};
+    std::uint32_t parentInode = 0;
+    std::string name;
+    if (!resolveParentAndName(path, parentInode, name)) {
         return false;
     }
-    if (!persistMetadata()) {
-        rootDirectory_.removeEntry(name);
-        inodeBitmap_.clear(static_cast<std::size_t>(inode));
-        inodes_[static_cast<std::size_t>(inode)] = Inode{};
+
+    Directory parentDir;
+    if (!loadDirectory(parentInode, parentDir)) {
+        setError("Failed to load parent directory");
         return false;
     }
+
+    if (parentDir.exists(name)) {
+        setError("File or directory '" + name + "' already exists");
+        return false;
+    }
+
+    const int newInodeIdx = allocateInode(InodeType::FILE);
+    if (newInodeIdx < 0) {
+        return false;
+    }
+
+    if (!parentDir.addEntry(name, static_cast<std::uint32_t>(newInodeIdx))) {
+        inodeBitmap_.clear(static_cast<std::size_t>(newInodeIdx));
+        inodes_[static_cast<std::size_t>(newInodeIdx)] = Inode{};
+        setError("Failed to add directory entry");
+        return false;
+    }
+
+    if (!saveDirectory(parentInode, parentDir)) {
+        parentDir.removeEntry(name);
+        inodeBitmap_.clear(static_cast<std::size_t>(newInodeIdx));
+        inodes_[static_cast<std::size_t>(newInodeIdx)] = Inode{};
+        setError("Failed to save parent directory");
+        return false;
+    }
+
     return true;
 }
 
 bool FileSystem::createDirectory(const std::string& path) {
-    if (!mounted_) return false;
-    const std::string normalized = normalizePath(path);
-    if (normalized == "/" || normalized.find('/', 1) != std::string::npos) return false;
-    const std::string name = normalized.substr(1);
-    if (name.empty() || name.size() >= DIRECTORY_NAME_BYTES || rootDirectory_.exists(name)) return false;
+    if (!mounted_) {
+        setError("Filesystem not mounted");
+        return false;
+    }
 
-    const int inode = allocateInode(InodeType::DIRECTORY);
-    if (inode < 0) return false;
-    if (!rootDirectory_.addEntry(name, static_cast<std::uint32_t>(inode))) {
-        inodeBitmap_.clear(static_cast<std::size_t>(inode));
-        inodes_[static_cast<std::size_t>(inode)] = Inode{};
+    std::uint32_t parentInode = 0;
+    std::string name;
+    if (!resolveParentAndName(path, parentInode, name)) {
         return false;
     }
-    if (!persistMetadata()) {
-        rootDirectory_.removeEntry(name);
-        inodeBitmap_.clear(static_cast<std::size_t>(inode));
-        inodes_[static_cast<std::size_t>(inode)] = Inode{};
+
+    Directory parentDir;
+    if (!loadDirectory(parentInode, parentDir)) {
+        setError("Failed to load parent directory");
         return false;
     }
+
+    if (parentDir.exists(name)) {
+        setError("File or directory '" + name + "' already exists");
+        return false;
+    }
+
+    const int newInodeIdx = allocateInode(InodeType::DIRECTORY);
+    if (newInodeIdx < 0) {
+        return false;
+    }
+
+    if (!parentDir.addEntry(name, static_cast<std::uint32_t>(newInodeIdx))) {
+        inodeBitmap_.clear(static_cast<std::size_t>(newInodeIdx));
+        inodes_[static_cast<std::size_t>(newInodeIdx)] = Inode{};
+        setError("Failed to add directory entry");
+        return false;
+    }
+
+    if (!saveDirectory(parentInode, parentDir)) {
+        parentDir.removeEntry(name);
+        inodeBitmap_.clear(static_cast<std::size_t>(newInodeIdx));
+        inodes_[static_cast<std::size_t>(newInodeIdx)] = Inode{};
+        setError("Failed to save parent directory");
+        return false;
+    }
+
     return true;
 }
 
 bool FileSystem::writeFile(const std::string& path, const std::string& data) {
-    if (!mounted_ || data.size() > B) return false;
-    const int index = findInode(path);
-    if (index < 0) return false;
-    Inode& inode = inodes_[static_cast<std::size_t>(index)];
-    if (!inode.isFile()) return false;
-
-    bool allocatedNow = false;
-    if (inode.directBlocks[0] == 0) {
-        const int block = allocateBlock();
-        if (block < 0) return false;
-        inode.directBlocks[0] = static_cast<std::uint32_t>(block);
-        allocatedNow = true;
-    }
-
-    std::vector<char> buffer(B, 0);
-    if (!data.empty()) std::memcpy(buffer.data(), data.data(), data.size());
-    if (!disk_.writeBlock(inode.directBlocks[0], buffer.data())) {
-        if (allocatedNow) {
-            freeBlock(inode.directBlocks[0]);
-            inode.directBlocks[0] = 0;
-        }
+    if (!mounted_) {
+        setError("Filesystem not mounted");
         return false;
     }
-    inode.size = static_cast<std::uint32_t>(data.size());
-    if (!persistMetadata()) return false;
-    return true;
+
+    const int inodeIdx = resolvePath(path);
+    if (inodeIdx < 0) {
+        setError("File not found: " + path);
+        return false;
+    }
+
+    if (!inodes_[static_cast<std::size_t>(inodeIdx)].isFile()) {
+        setError("Target is not a regular file: " + path);
+        return false;
+    }
+
+    return writeInodeData(static_cast<std::uint32_t>(inodeIdx),
+                          data.data(),
+                          data.size());
 }
 
 std::string FileSystem::readFile(const std::string& path) {
-    if (!mounted_) return {};
-    const int index = findInode(path);
-    if (index < 0) return {};
-    const Inode& inode = inodes_[static_cast<std::size_t>(index)];
-    if (!inode.isFile() || inode.size == 0 || inode.directBlocks[0] == 0 || inode.size > B)
+    if (!mounted_) {
+        setError("Filesystem not mounted");
         return {};
+    }
 
-    std::vector<char> buffer(B, 0);
-    if (!disk_.readBlock(inode.directBlocks[0], buffer.data())) return {};
-    return std::string(buffer.data(), inode.size);
+    const int inodeIdx = resolvePath(path);
+    if (inodeIdx < 0) {
+        setError("File not found: " + path);
+        return {};
+    }
+
+    if (!inodes_[static_cast<std::size_t>(inodeIdx)].isFile()) {
+        setError("Target is not a regular file: " + path);
+        return {};
+    }
+
+    std::vector<std::uint8_t> data;
+    if (!readInodeData(static_cast<std::uint32_t>(inodeIdx), data)) {
+        return {};
+    }
+
+    return std::string(reinterpret_cast<const char*>(data.data()), data.size());
 }
 
 bool FileSystem::deleteFile(const std::string& path) {
-    if (!mounted_) return false;
-    const std::string normalized = normalizePath(path);
-    if (normalized == "/" || normalized.find('/', 1) != std::string::npos) return false;
-    const std::string name = normalized.substr(1);
-    const int index = findInode(path);
-    if (index <= 0) return false;
-    Inode& inode = inodes_[static_cast<std::size_t>(index)];
-    if (!inode.isFile()) return false;
+    if (!mounted_) {
+        setError("Filesystem not mounted");
+        return false;
+    }
 
-    if (inode.directBlocks[0] != 0) freeBlock(inode.directBlocks[0]);
-    inode = Inode{};
-    inodeBitmap_.clear(static_cast<std::size_t>(index));
-    if (!rootDirectory_.removeEntry(name)) return false;
-    return persistMetadata();
+    std::uint32_t parentInode = 0;
+    std::string name;
+    if (!resolveParentAndName(path, parentInode, name)) {
+        return false;
+    }
+
+    Directory parentDir;
+    if (!loadDirectory(parentInode, parentDir)) {
+        setError("Failed to load parent directory");
+        return false;
+    }
+
+    const int targetIdx = parentDir.findEntry(name);
+    if (targetIdx < 0) {
+        setError("File '" + name + "' not found");
+        return false;
+    }
+
+    Inode& targetInode = inodes_[static_cast<std::size_t>(targetIdx)];
+    if (!targetInode.isFile()) {
+        setError("'" + name + "' is a directory, use rmdir");
+        return false;
+    }
+
+    freeInodeBlocks(targetInode);
+    targetInode = Inode{};
+    inodeBitmap_.clear(static_cast<std::size_t>(targetIdx));
+
+    parentDir.removeEntry(name);
+    if (!saveDirectory(parentInode, parentDir)) {
+        setError("Failed to update parent directory after deleting file");
+        return false;
+    }
+
+    return true;
 }
 
 bool FileSystem::deleteDirectory(const std::string& path) {
-    if (!mounted_) return false;
-    const std::string normalized = normalizePath(path);
-    if (normalized == "/" || normalized.find('/', 1) != std::string::npos) return false;
-    const std::string name = normalized.substr(1);
-    const int index = findInode(path);
-    if (index <= 0) return false;
-    Inode& inode = inodes_[static_cast<std::size_t>(index)];
-    if (!inode.isDirectory()) return false;
-    inode = Inode{};
-    inodeBitmap_.clear(static_cast<std::size_t>(index));
-    if (!rootDirectory_.removeEntry(name)) return false;
-    return persistMetadata();
+    if (!mounted_) {
+        setError("Filesystem not mounted");
+        return false;
+    }
+
+    const auto parts = splitPath(path);
+    if (parts.empty()) {
+        setError("Cannot delete root directory");
+        return false;
+    }
+
+    std::uint32_t parentInode = 0;
+    std::string name;
+    if (!resolveParentAndName(path, parentInode, name)) {
+        return false;
+    }
+
+    Directory parentDir;
+    if (!loadDirectory(parentInode, parentDir)) {
+        setError("Failed to load parent directory");
+        return false;
+    }
+
+    const int targetIdx = parentDir.findEntry(name);
+    if (targetIdx < 0) {
+        setError("Directory '" + name + "' not found");
+        return false;
+    }
+
+    Inode& targetInode = inodes_[static_cast<std::size_t>(targetIdx)];
+    if (!targetInode.isDirectory()) {
+        setError("'" + name + "' is not a directory");
+        return false;
+    }
+
+    Directory targetDir;
+    if (!loadDirectory(static_cast<std::uint32_t>(targetIdx), targetDir)) {
+        setError("Failed to inspect target directory contents");
+        return false;
+    }
+
+    if (!targetDir.empty()) {
+        setError("Cannot delete non-empty directory '" + name + "'");
+        return false;
+    }
+
+    freeInodeBlocks(targetInode);
+    targetInode = Inode{};
+    inodeBitmap_.clear(static_cast<std::size_t>(targetIdx));
+
+    parentDir.removeEntry(name);
+    if (!saveDirectory(parentInode, parentDir)) {
+        setError("Failed to update parent directory after deleting directory");
+        return false;
+    }
+
+    return true;
 }
 
 std::vector<std::string> FileSystem::listDirectory(const std::string& path) {
     std::vector<std::string> result;
-    if (!mounted_ || normalizePath(path) != "/") return result;
-    for (const auto& entry : rootDirectory_.getEntries()) result.push_back(entry.name);
+    if (!mounted_) {
+        setError("Filesystem not mounted");
+        return result;
+    }
+
+    const int inodeIdx = resolvePath(path);
+    if (inodeIdx < 0) {
+        setError("Directory not found: " + path);
+        return result;
+    }
+
+    if (!inodes_[static_cast<std::size_t>(inodeIdx)].isDirectory()) {
+        setError("Path is not a directory: " + path);
+        return result;
+    }
+
+    Directory dir;
+    if (!loadDirectory(static_cast<std::uint32_t>(inodeIdx), dir)) {
+        setError("Failed to load directory");
+        return result;
+    }
+
+    for (const auto& entry : dir.getEntries()) {
+        result.push_back(entry.name);
+    }
     return result;
 }
 
 bool FileSystem::exists(const std::string& path) const {
-    return mounted_ && findInode(path) >= 0;
+    return mounted_ && resolvePath(path) >= 0;
 }
 
 void FileSystem::printInfo() const {
@@ -291,106 +785,316 @@ void FileSystem::printInfo() const {
               << "Free blocks: " << blockBitmap_.countFree() << "\n"
               << "Total inodes: " << superblock_.totalInodes << "\n"
               << "Free inodes: " << inodeBitmap_.countFree() << "\n"
+              << "Data block start: " << superblock_.dataBlockStart << "\n"
+              << "Max file size: " << Inode::MAX_FILE_SIZE << " bytes ("
+              << (Inode::MAX_FILE_SIZE / 1024) << " KiB)\n"
               << "Mounted: " << (mounted_ ? "yes" : "no") << "\n"
               << "===============================\n";
 }
 
-bool FileSystem::persistRootDirectory() {
-    if (inodes_.empty() || inodes_[0].directBlocks[0] == 0) return false;
-    DiskDirectoryBlock diskDirectory{};
-    const auto& entries = rootDirectory_.getEntries();
-    if (entries.size() > std::size(diskDirectory.entries)) return false;
-    diskDirectory.count = static_cast<std::uint32_t>(entries.size());
-    for (std::size_t i = 0; i < entries.size(); ++i) {
-        if (entries[i].name.size() >= DIRECTORY_NAME_BYTES) return false;
-        diskDirectory.entries[i].inodeNumber = entries[i].inodeNumber;
-        std::memcpy(diskDirectory.entries[i].name, entries[i].name.c_str(), entries[i].name.size() + 1);
-    }
-    std::vector<char> block(B, 0);
-    std::memcpy(block.data(), &diskDirectory, sizeof(diskDirectory));
-    return disk_.writeBlock(inodes_[0].directBlocks[0], block.data());
-}
-
-bool FileSystem::loadRootDirectory() {
-    if (inodes_.empty() || inodes_[0].directBlocks[0] == 0) return false;
-    std::vector<char> block(B, 0);
-    if (!disk_.readBlock(inodes_[0].directBlocks[0], block.data())) return false;
-    DiskDirectoryBlock diskDirectory{};
-    std::memcpy(&diskDirectory, block.data(), sizeof(diskDirectory));
-    if (diskDirectory.count > std::size(diskDirectory.entries)) return false;
-
-    rootDirectory_ = Directory{};
-    for (std::size_t i = 0; i < diskDirectory.count; ++i) {
-        const auto& entry = diskDirectory.entries[i];
-        const auto length = ::strnlen(entry.name, DIRECTORY_NAME_BYTES);
-        if (length == 0 || length >= DIRECTORY_NAME_BYTES) return false;
-        if (entry.inodeNumber >= inodes_.size() || !inodeBitmap_.isSet(entry.inodeNumber)) return false;
-        if (!rootDirectory_.addEntry(std::string(entry.name, length), entry.inodeNumber)) return false;
-    }
-    return true;
-}
-
 bool FileSystem::persistMetadata() {
-    if (inodes_.empty() || !superblock_.isValid()) return false;
+    if (!superblock_.isValid()) {
+        setError("Superblock is not valid");
+        return false;
+    }
 
-    // The superblock tracks the current free counts.
     superblock_.freeBlocks = static_cast<std::uint32_t>(blockBitmap_.countFree());
     superblock_.freeInodes = static_cast<std::uint32_t>(inodeBitmap_.countFree());
 
-    std::vector<unsigned char> block(B, 0);
-    std::memcpy(block.data(), &superblock_, sizeof(superblock_));
-    if (!disk_.writeBlock(0, block.data())) return false;
-
-    // Store each bitmap as a compact bit-packed byte sequence in its own block.
-    std::fill(block.begin(), block.end(), 0);
-    for (std::size_t i = 0; i < inodeBitmap_.size(); ++i) {
-        if (inodeBitmap_.isSet(i)) block[i / 8] |= static_cast<unsigned char>(1u << (i % 8));
+    // 1. Superblock at block 0
+    std::vector<std::uint8_t> block(B, 0);
+    superblock_.serialize(block.data());
+    if (!disk_.writeBlock(0, block.data())) {
+        setError("Failed to write superblock to disk");
+        return false;
     }
-    if (inodeBitmap_.size() > B * 8 || !disk_.writeBlock(superblock_.inodeBitmapStart, block.data())) return false;
 
-    std::fill(block.begin(), block.end(), 0);
-    if (blockBitmap_.size() > B * 8) return false;
-    for (std::size_t i = 0; i < blockBitmap_.size(); ++i) {
-        if (blockBitmap_.isSet(i)) block[i / 8] |= static_cast<unsigned char>(1u << (i % 8));
+    // 2. Inode Bitmap
+    const auto& inodeBits = inodeBitmap_.getRawBits();
+    std::vector<std::uint8_t> inodeBitmapBuf(superblock_.inodeBitmapBlocks * B, 0);
+    if (!inodeBits.empty()) {
+        std::memcpy(inodeBitmapBuf.data(), inodeBits.data(), inodeBits.size());
     }
-    if (!disk_.writeBlock(superblock_.blockBitmapStart, block.data())) return false;
+    for (std::size_t i = 0; i < superblock_.inodeBitmapBlocks; ++i) {
+        if (!disk_.writeBlock(superblock_.inodeBitmapStart + i,
+                              inodeBitmapBuf.data() + i * B)) {
+            setError("Failed to write inode bitmap block " + std::to_string(i));
+            return false;
+        }
+    }
 
-    const std::size_t tableBytes = inodes_.size() * sizeof(Inode);
-    if (!writeBytesToBlocks(disk_, superblock_.inodeTableStart,
-                            superblock_.inodeTableBlocks, inodes_.data(), tableBytes)) return false;
+    // 3. Block Bitmap
+    const auto& blockBits = blockBitmap_.getRawBits();
+    std::vector<std::uint8_t> blockBitmapBuf(superblock_.blockBitmapBlocks * B, 0);
+    if (!blockBits.empty()) {
+        std::memcpy(blockBitmapBuf.data(), blockBits.data(), blockBits.size());
+    }
+    for (std::size_t i = 0; i < superblock_.blockBitmapBlocks; ++i) {
+        if (!disk_.writeBlock(superblock_.blockBitmapStart + i,
+                              blockBitmapBuf.data() + i * B)) {
+            setError("Failed to write block bitmap block " + std::to_string(i));
+            return false;
+        }
+    }
 
-    return persistRootDirectory();
+    // 4. Inode Table (32 inodes per block)
+    constexpr std::size_t INODES_PER_BLOCK = B / Inode::DISK_RECORD_SIZE;
+    for (std::size_t b = 0; b < superblock_.inodeTableBlocks; ++b) {
+        std::vector<std::uint8_t> tableBuf(B, 0);
+        for (std::size_t j = 0; j < INODES_PER_BLOCK; ++j) {
+            const std::size_t idx = b * INODES_PER_BLOCK + j;
+            if (idx < inodes_.size()) {
+                inodes_[idx].serialize(tableBuf.data() + j * Inode::DISK_RECORD_SIZE);
+            }
+        }
+        if (!disk_.writeBlock(superblock_.inodeTableStart + b, tableBuf.data())) {
+            setError("Failed to write inode table block " + std::to_string(b));
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool FileSystem::loadMetadata() {
-    std::vector<unsigned char> block(B, 0);
-    if (!disk_.readBlock(0, block.data())) return false;
-    std::memcpy(&superblock_, block.data(), sizeof(superblock_));
-    if (!superblock_.isValid() || superblock_.totalInodes == 0 ||
-        superblock_.totalBlocks == 0 || superblock_.inodeBitmapStart >= superblock_.totalBlocks ||
-        superblock_.blockBitmapStart >= superblock_.totalBlocks ||
-        superblock_.inodeTableStart + superblock_.inodeTableBlocks > superblock_.totalBlocks ||
-        superblock_.totalInodes > (superblock_.inodeTableBlocks * B) / sizeof(Inode) ||
-        superblock_.totalInodes > B * 8 || superblock_.totalBlocks > B * 8) return false;
+    std::string err;
+    if (!disk_.attachExisting(&err)) {
+        setError("Cannot attach disk: " + err);
+        return false;
+    }
 
+    std::vector<std::uint8_t> block(B, 0);
+    if (!disk_.readBlock(0, block.data())) {
+        setError("Failed to read superblock from disk");
+        return false;
+    }
+
+    superblock_ = Superblock::deserialize(block.data());
+    if (!superblock_.validateLayout(&err)) {
+        setError("Corrupt superblock layout: " + err);
+        return false;
+    }
+
+    if (superblock_.totalBlocks != disk_.getBlockCount()) {
+        setError("Disk file size (" + std::to_string(disk_.getBlockCount()) +
+                 " blocks) does not match superblock totalBlocks (" +
+                 std::to_string(superblock_.totalBlocks) + ")");
+        return false;
+    }
+
+    // Load Inode Bitmap
+    std::vector<std::uint8_t> inodeBitmapBuf(superblock_.inodeBitmapBlocks * B, 0);
+    for (std::size_t i = 0; i < superblock_.inodeBitmapBlocks; ++i) {
+        if (!disk_.readBlock(superblock_.inodeBitmapStart + i,
+                             inodeBitmapBuf.data() + i * B)) {
+            setError("Failed to read inode bitmap block " + std::to_string(i));
+            return false;
+        }
+    }
     inodeBitmap_.initialize(superblock_.totalInodes);
+    inodeBitmap_.loadBits(inodeBitmapBuf.data(), inodeBitmapBuf.size());
+
+    // Load Block Bitmap
+    std::vector<std::uint8_t> blockBitmapBuf(superblock_.blockBitmapBlocks * B, 0);
+    for (std::size_t i = 0; i < superblock_.blockBitmapBlocks; ++i) {
+        if (!disk_.readBlock(superblock_.blockBitmapStart + i,
+                             blockBitmapBuf.data() + i * B)) {
+            setError("Failed to read block bitmap block " + std::to_string(i));
+            return false;
+        }
+    }
     blockBitmap_.initialize(superblock_.totalBlocks);
+    blockBitmap_.loadBits(blockBitmapBuf.data(), blockBitmapBuf.size());
+
+    // Load Inode Table
+    constexpr std::size_t INODES_PER_BLOCK = B / Inode::DISK_RECORD_SIZE;
     inodes_.assign(superblock_.totalInodes, Inode{});
-
-    if (!disk_.readBlock(superblock_.inodeBitmapStart, block.data())) return false;
-    for (std::size_t i = 0; i < inodeBitmap_.size(); ++i) {
-        if ((block[i / 8] & static_cast<unsigned char>(1u << (i % 8))) != 0) inodeBitmap_.set(i);
+    for (std::size_t b = 0; b < superblock_.inodeTableBlocks; ++b) {
+        std::vector<std::uint8_t> tableBuf(B, 0);
+        if (!disk_.readBlock(superblock_.inodeTableStart + b, tableBuf.data())) {
+            setError("Failed to read inode table block " + std::to_string(b));
+            return false;
+        }
+        for (std::size_t j = 0; j < INODES_PER_BLOCK; ++j) {
+            const std::size_t idx = b * INODES_PER_BLOCK + j;
+            if (idx < inodes_.size()) {
+                inodes_[idx] = Inode::deserialize(tableBuf.data() + j * Inode::DISK_RECORD_SIZE);
+            }
+        }
     }
 
-    if (!disk_.readBlock(superblock_.blockBitmapStart, block.data())) return false;
-    for (std::size_t i = 0; i < blockBitmap_.size(); ++i) {
-        if ((block[i / 8] & static_cast<unsigned char>(1u << (i % 8))) != 0) blockBitmap_.set(i);
+    // Comprehensive consistency audit
+    if (!validateMetadataConsistency(&err)) {
+        setError("Filesystem metadata consistency check failed: " + err);
+        return false;
     }
 
-    if (!readBytesFromBlocks(disk_, superblock_.inodeTableStart,
-                            superblock_.inodeTableBlocks, inodes_.data(),
-                            inodes_.size() * sizeof(Inode))) return false;
-    if (inodes_.empty() || !inodeBitmap_.isSet(0) || !inodes_[0].isDirectory()) return false;
-    return loadRootDirectory();
+    return true;
 }
 
+bool FileSystem::validateMetadataConsistency(std::string* error) const {
+    // 1. Root inode must be allocated and must be a DIRECTORY
+    if (!inodeBitmap_.isSet(Superblock::ROOT_INODE)) {
+        return fail(error, "Root inode 0 is not marked allocated in inode bitmap");
+    }
+    if (!inodes_[Superblock::ROOT_INODE].isDirectory()) {
+        return fail(error, "Root inode 0 is not a directory");
+    }
+
+    // 2. Metadata blocks must be marked allocated in block bitmap
+    if (!blockBitmap_.isSet(0)) {
+        return fail(error, "Superblock block 0 is not marked allocated");
+    }
+    for (std::size_t i = 0; i < superblock_.inodeBitmapBlocks; ++i) {
+        if (!blockBitmap_.isSet(superblock_.inodeBitmapStart + i)) {
+            return fail(error, "Inode bitmap block is marked free in block bitmap");
+        }
+    }
+    for (std::size_t i = 0; i < superblock_.blockBitmapBlocks; ++i) {
+        if (!blockBitmap_.isSet(superblock_.blockBitmapStart + i)) {
+            return fail(error, "Block bitmap block is marked free in block bitmap");
+        }
+    }
+    for (std::size_t i = 0; i < superblock_.inodeTableBlocks; ++i) {
+        if (!blockBitmap_.isSet(superblock_.inodeTableStart + i)) {
+            return fail(error, "Inode table block is marked free in block bitmap");
+        }
+    }
+
+    // 3. Track reference counts for all data blocks to detect double allocation or leaks
+    std::vector<std::uint32_t> blockRefs(superblock_.totalBlocks, 0);
+
+    // Mark metadata blocks
+    blockRefs[0] = 1;
+    for (std::size_t i = 0; i < superblock_.inodeBitmapBlocks; ++i) {
+        blockRefs[superblock_.inodeBitmapStart + i] = 1;
+    }
+    for (std::size_t i = 0; i < superblock_.blockBitmapBlocks; ++i) {
+        blockRefs[superblock_.blockBitmapStart + i] = 1;
+    }
+    for (std::size_t i = 0; i < superblock_.inodeTableBlocks; ++i) {
+        blockRefs[superblock_.inodeTableStart + i] = 1;
+    }
+
+    // 4. Inode table vs inode bitmap
+    for (std::size_t i = 0; i < inodes_.size(); ++i) {
+        const Inode& in = inodes_[i];
+        if (inodeBitmap_.isSet(i)) {
+            if (in.isFree()) {
+                return fail(error, "Inode " + std::to_string(i) +
+                                       " is marked allocated in bitmap but is FREE in table");
+            }
+            if (in.inodeNumber != i) {
+                return fail(error, "Inode " + std::to_string(i) +
+                                       " has mismatched number " + std::to_string(in.inodeNumber));
+            }
+
+            // Check direct block pointers
+            for (std::size_t d = 0; d < Inode::DIRECT_BLOCKS; ++d) {
+                const std::uint32_t blk = in.directBlocks[d];
+                if (blk != 0) {
+                    if (blk < superblock_.dataBlockStart || blk >= superblock_.totalBlocks) {
+                        return fail(error, "Inode " + std::to_string(i) +
+                                               " direct block pointer " + std::to_string(blk) +
+                                               " out of data range");
+                    }
+                    if (!blockBitmap_.isSet(blk)) {
+                        return fail(error, "Inode " + std::to_string(i) +
+                                               " references block " + std::to_string(blk) +
+                                               " marked free in block bitmap");
+                    }
+                    if (blockRefs[blk] > 0) {
+                        return fail(error, "Duplicate block allocation: block " +
+                                               std::to_string(blk) + " referenced multiple times");
+                    }
+                    blockRefs[blk] = 1;
+                }
+            }
+
+            // Check indirect block
+            if (in.indirectBlock != 0) {
+                const std::uint32_t indBlk = in.indirectBlock;
+                if (indBlk < superblock_.dataBlockStart || indBlk >= superblock_.totalBlocks) {
+                    return fail(error, "Inode " + std::to_string(i) +
+                                           " indirect block pointer " + std::to_string(indBlk) +
+                                           " out of range");
+                }
+                if (!blockBitmap_.isSet(indBlk)) {
+                    return fail(error, "Inode " + std::to_string(i) +
+                                           " indirect block " + std::to_string(indBlk) +
+                                           " marked free in block bitmap");
+                }
+                if (blockRefs[indBlk] > 0) {
+                    return fail(error, "Duplicate block allocation for indirect block " +
+                                           std::to_string(indBlk));
+                }
+                blockRefs[indBlk] = 1;
+
+                std::vector<std::uint8_t> indBuf(B, 0);
+                if (!disk_.readBlock(indBlk, indBuf.data())) {
+                    return fail(error, "Cannot read indirect block " + std::to_string(indBlk));
+                }
+                for (std::size_t p = 0; p < Inode::POINTERS_PER_INDIRECT; ++p) {
+                    const std::uint32_t ptr = byteio::getU32(indBuf.data() + p * 4);
+                    if (ptr != 0) {
+                        if (ptr < superblock_.dataBlockStart || ptr >= superblock_.totalBlocks) {
+                            return fail(error, "Indirect entry references out of range block " +
+                                                   std::to_string(ptr));
+                        }
+                        if (!blockBitmap_.isSet(ptr)) {
+                            return fail(error, "Indirect block references block " +
+                                                   std::to_string(ptr) +
+                                                   " marked free in block bitmap");
+                        }
+                        if (blockRefs[ptr] > 0) {
+                            return fail(error, "Duplicate block allocation in indirect table: " +
+                                                   std::to_string(ptr));
+                        }
+                        blockRefs[ptr] = 1;
+                    }
+                }
+            }
+
+            // Check directory entries if this is a directory
+            if (in.isDirectory()) {
+                Directory dir;
+                if (!loadDirectory(static_cast<std::uint32_t>(i), dir)) {
+                    return fail(error, "Directory inode " + std::to_string(i) +
+                                           " has corrupt directory data");
+                }
+                for (const auto& entry : dir.getEntries()) {
+                    if (entry.inodeNumber >= inodes_.size()) {
+                        return fail(error, "Directory entry '" + entry.name +
+                                               "' points to out-of-range inode " +
+                                               std::to_string(entry.inodeNumber));
+                    }
+                    if (!inodeBitmap_.isSet(entry.inodeNumber)) {
+                        return fail(error, "Directory entry '" + entry.name +
+                                               "' points to unallocated inode " +
+                                               std::to_string(entry.inodeNumber));
+                    }
+                }
+            }
+        } else {
+            // Unallocated inode must be clean
+            if (!in.isFree()) {
+                return fail(error, "Inode " + std::to_string(i) +
+                                       " is marked FREE in bitmap but not FREE in table");
+            }
+        }
+    }
+
+    // 5. Block bitmap consistency with block references (leak check)
+    for (std::size_t b = superblock_.dataBlockStart; b < superblock_.totalBlocks; ++b) {
+        if (blockBitmap_.isSet(b) && blockRefs[b] == 0) {
+            return fail(error, "Block " + std::to_string(b) +
+                                   " is marked allocated in bitmap but is orphaned/unreferenced");
+        }
+        if (!blockBitmap_.isSet(b) && blockRefs[b] != 0) {
+            return fail(error, "Block " + std::to_string(b) +
+                                   " is unallocated in bitmap but referenced by an inode");
+        }
+    }
+
+    return true;
+}

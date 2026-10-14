@@ -29,6 +29,14 @@ public:
 
     std::size_t countUsed() const;
 
+    const std::vector<std::uint8_t>& getRawBits() const;
+
+    const std::uint8_t* data() const;
+
+    std::size_t byteSize() const;
+
+    void loadBits(const std::uint8_t* buffer, std::size_t byteCount);
+
 private:
     std::vector<std::uint8_t> bits_;
     std::size_t bitCount_;

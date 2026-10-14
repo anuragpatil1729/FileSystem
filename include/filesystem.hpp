@@ -33,26 +33,46 @@ public:
     bool exists(const std::string& path) const;
     void printInfo() const;
 
+    // Additional diagnostic and inspection methods
+    bool isMounted() const;
+    const std::string& getLastError() const;
+    const Superblock& getSuperblock() const;
+    DiskManager& getDiskManager();
+    const DiskManager& getDiskManager() const;
+    std::size_t getMaxFileSize() const;
+
 private:
     DiskManager disk_;
     Superblock superblock_;
     Bitmap inodeBitmap_;
     Bitmap blockBitmap_;
     std::vector<Inode> inodes_;
-    Directory rootDirectory_;
     bool mounted_;
+    mutable std::string lastError_;
+
+    void setError(const std::string& msg) const;
 
     int findInode(const std::string& path) const;
     int allocateInode(InodeType type);
     int allocateBlock();
     bool freeBlock(std::size_t blockNumber);
-    std::string normalizePath(const std::string& path) const;
+    void freeInodeBlocks(Inode& inode);
+
+    static std::vector<std::string> splitPath(const std::string& path);
+    bool resolveParentAndName(const std::string& path,
+                              std::uint32_t& parentInode,
+                              std::string& entryName) const;
+    int resolvePath(const std::string& path) const;
+
+    bool loadDirectory(std::uint32_t inodeNumber, Directory& dir) const;
+    bool saveDirectory(std::uint32_t inodeNumber, const Directory& dir);
+
+    bool readInodeData(std::uint32_t inodeNumber, std::vector<std::uint8_t>& out) const;
+    bool writeInodeData(std::uint32_t inodeNumber, const void* data, std::size_t size);
 
     bool persistMetadata();
     bool loadMetadata();
-    bool persistRootDirectory();
-    bool loadRootDirectory();
+    bool validateMetadataConsistency(std::string* error) const;
 };
 
 #endif
-

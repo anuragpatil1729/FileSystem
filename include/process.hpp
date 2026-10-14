@@ -19,7 +19,8 @@ public:
         std::uint32_t pid,
         const std::string& name,
         std::size_t burstTime,
-        int priority = 0
+        int priority = 0,
+        std::size_t arrivalTime = 0
     );
 
     std::uint32_t getPid() const;
@@ -31,6 +32,8 @@ public:
     std::size_t getRemainingTime() const;
 
     int getPriority() const;
+
+    std::size_t getArrivalTime() const;
 
     ProcessState getState() const;
 
@@ -44,6 +47,8 @@ public:
 
     bool isFinished() const;
 
+    void reset();
+
 private:
     std::uint32_t pid_;
 
@@ -54,6 +59,8 @@ private:
     std::size_t remainingTime_;
 
     int priority_;
+
+    std::size_t arrivalTime_;
 
     ProcessState state_;
 };

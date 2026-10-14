@@ -1,168 +1,141 @@
-
 # VirtualFileSystem
 
-A C++17 educational project demonstrating filesystem internals and
-selected operating-system concepts through a simulated disk, file
-metadata, CPU scheduling, and virtual memory.
+A robust, functional C++17 user-space operating system environment featuring a persistent block-based filesystem, a Round-Robin CPU process scheduler with metrics, and a virtual memory manager with demand paging and page replacement.
 
-## Features
+## Key Features
 
-### Virtual filesystem
-- Simulated disk backed by a binary file.
-- Fixed-size disk blocks.
-- Superblock metadata.
-- Inode-based file metadata.
-- Bitmap-based resource allocation.
-- Directory entries mapping names to inode numbers.
-- Basic file creation, reading, writing, listing, and deletion.
+### 1. Persistent Block-Based Virtual Filesystem
+- **Disk Geometry & Safe Mounting**: Backed by a binary disk file. The active disk manager synchronizes geometry with the formatted layout. Existing valid images are mounted and restored; corrupted images are safely rejected without silent overwrites.
+- **Persistent Metadata**: On-disk versioned Superblock, multi-block Inode and Data-block Bitmaps, Inode Table (32 inodes/block), and directory entries stored in allocated data blocks.
+- **Hierarchical Directory Tree**: Full path resolution supporting arbitrary directory nesting (e.g., `/projects/VirtualOS/src/main.cpp`). Normalized path traversal handles redundant/trailing slashes (`///a//b/`). Deletion safety enforces non-empty directory protection and prevents root deletion.
+- **Multi-Block File Storage**: Supports empty files and multi-block files up to **4,243,456 bytes** (4.047 MiB) using 12 direct block pointers and 1 single-indirect block pointer (1024 block references).
+- **Operation Safety & Rollback**: Staged allocation with automatic rollback on disk write failures or storage exhaustion, preventing block leaks and metadata corruption.
+- **Metadata Consistency Checks**: Mount-time auditing validates magic, version, region boundaries, bitmap-to-inode consistency, leak-free block reference counting, and directory integrity.
 
-### CPU virtualization
-- Simulated processes with process IDs.
-- Process states and CPU burst tracking.
-- Round-Robin scheduling with configurable time quantum.
-- Execution-order logging.
+### 2. CPU Virtualization & Scheduling
+- **Round-Robin Scheduling**: Preemptive execution tracking using configurable time quanta.
+- **Gantt Chart & Execution Logging**: Visual timeline slices and process execution orders.
+- **Process Metrics & Workloads**: Tracks PID, state (`NEW`, `READY`, `RUNNING`, `BLOCKED`, `TERMINATED`), CPU burst, arrival time, completion time, waiting time, turnaround time, and initial response time.
+- **Average Metrics & Utilization**: Computes average waiting time, average turnaround time, and CPU utilization percentage.
+- **Repeatable & Interactive**: Re-executable workloads, duplicate scheduling rejection, and interactive CLI commands to create and run custom processes.
 
-### Memory virtualization
-- Simulated physical memory.
-- Fixed-size pages and frames.
-- Per-process page tables.
-- Virtual-to-physical address translation.
-- Memory read/write operations and frame reclamation.
+### 3. Virtual Memory Virtualization
+- **Paged Memory**: Configurable physical memory frames (default 64 KiB with 4 KiB page size) and per-process page tables.
+- **Virtual-to-Physical Address Translation**: Translation bounds checking, integer overflow safeguards, and write-permission verification.
+- **Allocation Policies**: Supports both eager allocation and **Demand Paging**.
+- **Page Replacement Algorithms**: Implements configurable **FIFO** (First-In, First-Out) and **LRU** (Least Recently Used) page replacement when physical frames are exhausted.
+- **Diagnostics & Metrics**: Tracks cumulative page faults, frame evictions/replacements, and provides real-time frame allocation maps.
 
-## Tech stack
+---
 
-- C++17
-- CMake
-- GNU Make
-- Standard C++ library
+## Tech Stack & Standards
 
-## Project structure
+- **Language**: C++17 (`-Wall -Wextra -Wpedantic`)
+- **Build Systems**: CMake 3.16+ and GNU Make
+- **Architecture**: Portable little-endian binary serialization (`byte_io.hpp`), RAII resource management, zero raw owning pointers.
+
+---
+
+## Project Structure
 
 ```text
 VirtualFileSystem/
-├── include/       # Header files
-├── src/           # Implementations and CLI
-├── tests/         # Component tests
-├── docs/          # Architecture documentation
-├── data/          # Virtual disk files
+├── include/
+│   ├── bitmap.hpp          # Bitmap allocator with raw byte access
+│   ├── byte_io.hpp         # Portable little-endian binary serialization
+│   ├── directory.hpp       # Binary directory serialization and entry table
+│   ├── disk_manager.hpp    # Block I/O, geometry detection, and fault injection
+│   ├── filesystem.hpp      # Filesystem core, path resolution, multi-block files
+│   ├── inode.hpp           # 128-byte inode format with direct/indirect blocks
+│   ├── memory_manager.hpp  # Paged memory, demand paging, FIFO/LRU replacement
+│   ├── page_table.hpp      # Per-process page table and entry metadata
+│   ├── process.hpp         # Simulated process representation and state
+│   ├── scheduler.hpp       # Round-Robin scheduler and performance metrics
+│   └── superblock.hpp      # Filesystem geometry and structural layout validator
+├── src/
+│   ├── bitmap.cpp
+│   ├── directory.cpp
+│   ├── disk_manager.cpp
+│   ├── filesystem.cpp
+│   ├── inode.cpp
+│   ├── main.cpp            # Integrated interactive CLI shell
+│   ├── memory_manager.cpp
+│   ├── page_table.cpp
+│   ├── process.cpp
+│   ├── scheduler.cpp
+│   └── superblock.cpp
+├── tests/
+│   ├── test_disk.cpp       # Block I/O, resizing, fault injection tests
+│   ├── test_filesystem.cpp # Hierarchy, multi-block, persistence, rollback tests
+│   ├── test_memory.cpp     # Translation, demand paging, FIFO & LRU tests
+│   └── test_scheduler.cpp  # Round-robin, arrival times, metrics tests
+├── docs/
+│   └── architecture.md     # In-depth architectural design specification
 ├── CMakeLists.txt
 ├── Makefile
 ├── README.md
 └── .gitignore
 ```
 
-## Requirements
+---
 
-- A C++17-compatible compiler
-- CMake 3.16 or newer for the CMake workflow
-- GNU Make for the Makefile workflow
+## Building and Testing
 
-On macOS, install Apple's command-line developer tools if necessary:
-
-```bash
-xcode-select --install
-```
-
-Check your tools:
-
-```bash
-clang++ --version
-cmake --version
-make --version
-```
-
-## Build with CMake
-
-Run these commands from the project root:
+### Build with CMake
 
 ```bash
 cmake -S . -B build
 cmake --build build
 ```
 
-Run the application:
-
-```bash
-./build/vfs
-```
-
-Run all tests:
-
+Run test suite:
 ```bash
 ctest --test-dir build --output-on-failure
 ```
 
-## Build with Make
+Launch application:
+```bash
+./build/vfs
+```
 
-Build the application:
+### Build with GNU Make
 
 ```bash
 make
-```
-
-Run the application:
-
-```bash
-make run
-```
-
-Run all component tests:
-
-```bash
 make test
+./build/vfs
 ```
 
-Remove generated build files:
+---
 
-```bash
-make clean
-```
+## Interactive CLI Commands
 
-## CLI commands
+Start the environment with `./build/vfs`:
 
-Once the application starts, type `help` to see available commands.
+### Filesystem Commands
+- `ls [path]` : List entries in directory (e.g., `ls /`, `ls /projects`).
+- `create <path>` : Create an empty file (e.g., `create /projects/README.md`).
+- `mkdir <path>` : Create a new directory (e.g., `mkdir /projects/VirtualOS`).
+- `write <path> <text>` : Write multi-block text data to a file.
+- `read <path>` : Read and display file contents.
+- `rm <path>` : Delete a file and reclaim its data blocks and inode.
+- `rmdir <path>` : Delete an empty directory.
+- `info` : Display filesystem geometry, allocated/free blocks, and inodes.
+- `format [blocks] [inodes]` : Format the virtual disk image with custom geometry.
 
-Examples:
+### CPU Scheduler Commands
+- `cpu` : Run CPU scheduler demo with predefined workload.
+- `sched-add <name> <burst> [priority] [arrival]` : Add process to active scheduler.
+- `sched-run [quantum]` : Execute scheduler and view Gantt chart and statistics.
+- `sched-clear` : Clear scheduler ready queue.
 
-```text
-create /hello.txt
-write /hello.txt Hello World
-read /hello.txt
-ls
-info
-cpu
-mem
-rm /hello.txt
-exit
-```
+### Virtual Memory Commands
+- `mem` : Run virtual memory demonstration with demand paging.
+- `mem-alloc <pid> <bytes>` : Allocate virtual memory for a process.
+- `mem-free <pid>` : Free physical frames and page table for a process.
+- `mem-write <pid> <addr> <val>` : Write byte value to process virtual address.
+- `mem-read <pid> <addr>` : Read byte value from process virtual address.
+- `mem-map` : Print physical frame allocation map and fault statistics.
+- `mem-policy <eager|demand> [fifo|lru]` : Switch allocation and replacement policies.
 
-## Current implementation scope
-
-This is an educational prototype, not a production filesystem or
-a complete operating system.
-
-Current limitations include:
-
-- Filesystem metadata is not yet fully serialized to disk.
-- The current CLI formats the virtual disk on startup.
-- Directory handling is flat rather than a complete nested hierarchy.
-- File storage currently supports a limited data-block implementation.
-- CPU scheduling and memory management are simulations within a
-  user-space program, not kernel-level virtualization.
-- Crash recovery, permissions enforcement, concurrency, and
-  persistent mounting are not implemented.
-
-## Future improvements
-
-- Persist and reload superblocks, bitmaps, inodes, and directories.
-- Implement nested directories and path traversal.
-- Support files spanning multiple data blocks.
-- Add filesystem consistency checks and recovery.
-- Add process arrival times and scheduling metrics.
-- Implement page replacement and page-fault handling.
-- Expand tests for failure cases and persistence.
-
-## License
-
-Choose and add a license before distributing or accepting contributions.
-
+- `exit` : Safely unmount filesystem and quit.

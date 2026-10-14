@@ -6,13 +6,15 @@ Process::Process(
     std::uint32_t pid,
     const std::string& name,
     std::size_t burstTime,
-    int priority
+    int priority,
+    std::size_t arrivalTime
 )
     : pid_(pid),
       name_(name),
       burstTime_(burstTime),
       remainingTime_(burstTime),
       priority_(priority),
+      arrivalTime_(arrivalTime),
       state_(ProcessState::NEW) {
 }
 
@@ -34,6 +36,10 @@ std::size_t Process::getRemainingTime() const {
 
 int Process::getPriority() const {
     return priority_;
+}
+
+std::size_t Process::getArrivalTime() const {
+    return arrivalTime_;
 }
 
 ProcessState Process::getState() const {
@@ -75,4 +81,9 @@ void Process::execute(
 
 bool Process::isFinished() const {
     return remainingTime_ == 0;
+}
+
+void Process::reset() {
+    remainingTime_ = burstTime_;
+    state_ = ProcessState::READY;
 }
