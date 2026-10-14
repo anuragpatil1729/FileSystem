@@ -1,0 +1,34 @@
+
+# Build directories
+build/
+cmake-build-*/
+
+# Object files and libraries
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# Executables
+vfs
+test_disk
+test_filesystem
+test_scheduler
+test_memory
+
+# Generated virtual disk images
+data/*.bin
+
+# Temporary test artifacts
+core
+core.*
+
+# Editor and operating system files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
