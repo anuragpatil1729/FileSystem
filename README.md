@@ -425,8 +425,4 @@ VirtualFileSystem/
 
 ## Engineering Standards & Design Principles
 
-- **Modern C++17**: Standardized idioms (`std::optional`, `std::unique_ptr`, `std::string_view`, structured bindings).
-- **Strict Compiler Warnings**: Builds with zero warnings under `-Wall -Wextra -Wpedantic`.
-- **Zero Raw Owning Pointers**: Full RAII memory management across all disk, process, and memory management subsystems.
-- **Endian-Independent Serialization**: Multi-byte integers serialize in explicit little-endian format, ensuring binary disk images are portable across x86_64, ARM64, and other architectures.
-- **Deterministic Crash Rollback**: Staged allocation ensures metadata consistency is never compromised by incomplete writes or exhausted disk capacity.
+
